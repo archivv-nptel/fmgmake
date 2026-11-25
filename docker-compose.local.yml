@@ -1,0 +1,197 @@
+# Build the web app and Cube from this checkout; no prebuilt Formbricks images are pulled.
+# Run from the repository root: docker compose -f docker-compose.local.yml up --build -d
+# Set secrets in the ignored root .env (start from .env.example). Use URL-safe passwords,
+# or set POSTGRES_PASSWORD_URL_ENCODED to the percent-encoded POSTGRES_PASSWORD.
+# Hub is a separate project whose source is not in this snapshot: provision it separately
+# and set HUB_API_URL to a URL reachable from containers plus its matching HUB_API_KEY.
+# Optional SMTP, storage, OAuth/SSO, and telemetry settings pass through the root .env.
+
+x-app: &app
+  image: fmgmake-formbricks:local
+  pull_policy: build
+  build:
+    context: .
+    dockerfile: apps/web/Dockerfile
+    args:
+      NODE_OPTIONS: ${DOCKER_BUILD_NODE_OPTIONS:---max-old-space-size=8192}
+  env_file:
+    - path: .env
+      required: false
+  environment: &app-environment
+    DATABASE_URL: postgresql://postgres:${POSTGRES_PASSWORD_URL_ENCODED:-${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}}@postgres:5432/formbricks?schema=public
+    WEBAPP_URL: ${WEBAPP_URL:-http://localhost:3000}
+    BETTER_AUTH_URL: ${BETTER_AUTH_URL:-${WEBAPP_URL:-http://localhost:3000}}
+    # The runtime validator requires this or the legacy NEXTAUTH_SECRET alias.
+    BETTER_AUTH_SECRET: ${BETTER_AUTH_SECRET:-${NEXTAUTH_SECRET:-}}
+    ENCRYPTION_KEY: ${ENCRYPTION_KEY:?Set ENCRYPTION_KEY in .env}
+    CRON_SECRET: ${CRON_SECRET:?Set CRON_SECRET in .env}
+    REDIS_URL: redis://redis:6379
+    CUBEJS_API_URL: http://cube:4000
+    CUBEJS_API_SECRET: ${CUBEJS_API_SECRET:?Set CUBEJS_API_SECRET in .env}
+    CUBEJS_JWT_ISSUER: ${CUBEJS_JWT_ISSUER:-formbricks-web}
+    CUBEJS_JWT_AUDIENCE: ${CUBEJS_JWT_AUDIENCE:-formbricks-cube}
+    HUB_API_URL: ${HUB_API_URL:?Set the URL of your separately provisioned Hub}
+    HUB_API_KEY: ${HUB_API_KEY:?Set the API key of your separately provisioned Hub}
+    AUTHZED_ENABLED: "true"
+    AUTHZED_ENDPOINT: spicedb:50051
+    AUTHZED_TOKEN: ${AUTHZED_TOKEN:?Set AUTHZED_TOKEN in .env}
+    AUTHZED_SYSTEM_KEY: ${AUTHZED_SYSTEM_KEY:-formbricks}
+    AUTHZED_INSECURE: "true"
+    AUTHZED_CONSISTENCY: fully_consistent
+    SKIP_STARTUP_MIGRATION: "true"
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg18
+    restart: unless-stopped
+    shm_size: 512mb
+    environment:
+      POSTGRES_DB: formbricks
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+    volumes:
+      - postgres:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d formbricks"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 30s
+
+  redis:
+    image: valkey/valkey@sha256:418652cfb58ef879d4978c33553735d7147016032d5aefaa14c828e611eb9dfd
+    restart: unless-stopped
+    command: valkey-server --appendonly yes --maxmemory-policy noeviction
+    volumes:
+      - redis:/data
+    healthcheck:
+      test: ["CMD", "valkey-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+
+  authzed-db-bootstrap:
+    image: pgvector/pgvector:pg18
+    restart: "no"
+    entrypoint: ["/bin/sh", "/usr/local/bin/authzed-postgres-bootstrap.sh"]
+    environment:
+      POSTGRES_ADMIN_URL: postgresql://postgres:${POSTGRES_PASSWORD_URL_ENCODED:-${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}}@postgres:5432/postgres?sslmode=disable
+      AUTHZED_DATABASE_PASSWORD: ${AUTHZED_DATABASE_PASSWORD:?Set a URL-safe AUTHZED_DATABASE_PASSWORD in .env}
+    volumes:
+      - ./docker/authzed-postgres-bootstrap.sh:/usr/local/bin/authzed-postgres-bootstrap.sh:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  spicedb-migrate:
+    image: authzed/spicedb:v1.57.1
+    restart: "no"
+    command: datastore migrate head
+    environment:
+      SPICEDB_DATASTORE_ENGINE: postgres
+      SPICEDB_DATASTORE_CONN_URI: postgresql://spicedb:${AUTHZED_DATABASE_PASSWORD:?Set a URL-safe AUTHZED_DATABASE_PASSWORD in .env}@postgres:5432/spicedb?sslmode=disable
+    depends_on:
+      authzed-db-bootstrap:
+        condition: service_completed_successfully
+
+  spicedb:
+    image: authzed/spicedb:v1.57.1
+    restart: unless-stopped
+    command: serve
+    mem_limit: 512m
+    environment:
+      SPICEDB_DATASTORE_ENGINE: postgres
+      SPICEDB_DATASTORE_CONN_URI: postgresql://spicedb:${AUTHZED_DATABASE_PASSWORD:?Set a URL-safe AUTHZED_DATABASE_PASSWORD in .env}@postgres:5432/spicedb?sslmode=disable
+      SPICEDB_GRPC_PRESHARED_KEY: ${AUTHZED_TOKEN:?Set AUTHZED_TOKEN in .env}
+      SPICEDB_LOG_FORMAT: json
+      SPICEDB_TELEMETRY_ENDPOINT: ""
+    depends_on:
+      spicedb-migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/grpc_health_probe", "-addr=localhost:50051"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
+  formbricks-migrate:
+    <<: *app
+    restart: "no"
+    entrypoint: ["sh", "-c"]
+    command:
+      - node /home/nextjs/validate-env.mjs && node packages/database/dist/scripts/apply-migrations.js
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  authzed-initialize:
+    <<: *app
+    restart: "no"
+    entrypoint: ["formbricks-authzed"]
+    command: ["upgrade", "prepare"]
+    depends_on:
+      formbricks-migrate:
+        condition: service_completed_successfully
+      spicedb:
+        condition: service_healthy
+
+  cube:
+    image: fmgmake-cube:local
+    pull_policy: build
+    build:
+      context: ./docker/cube-image
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    environment:
+      CUBEJS_DB_TYPE: postgres
+      # Match the database used by your separately provisioned Hub for analytics.
+      CUBEJS_DB_HOST: ${CUBEJS_DB_HOST:-postgres}
+      CUBEJS_DB_NAME: ${CUBEJS_DB_NAME:-formbricks}
+      CUBEJS_DB_USER: ${CUBEJS_DB_USER:-postgres}
+      CUBEJS_DB_PASS: ${CUBEJS_DB_PASS:-${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}}
+      CUBEJS_DB_PORT: ${CUBEJS_DB_PORT:-5432}
+      CUBEJS_API_SECRET: ${CUBEJS_API_SECRET:?Set CUBEJS_API_SECRET in .env}
+      CUBEJS_JWT_ISSUER: ${CUBEJS_JWT_ISSUER:-formbricks-web}
+      CUBEJS_JWT_AUDIENCE: ${CUBEJS_JWT_AUDIENCE:-formbricks-cube}
+      CUBEJS_DEFAULT_API_SCOPES: meta,data
+      CUBEJS_EXTERNAL_DEFAULT: "false"
+      CUBEJS_CACHE_AND_QUEUE_DRIVER: memory
+      CUBEJS_DB_QUERY_TIMEOUT: ${CUBEJS_DB_QUERY_TIMEOUT:-60s}
+    volumes:
+      - ./docker/cube/cube.js:/cube/conf/cube.js:ro
+      - ./docker/cube/schema:/cube/conf/model:ro
+    depends_on:
+      formbricks-migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "require('http').get('http://127.0.0.1:4000/readyz', (res) => { res.resume(); process.exit(res.statusCode === 200 ? 0 : 1); }).on('error', () => process.exit(1));"
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+
+  formbricks:
+    <<: *app
+    restart: unless-stopped
+    ports:
+      - "${LOCAL_BIND_ADDRESS:-127.0.0.1}:${LOCAL_PORT:-3000}:3000"
+    volumes:
+      - uploads:/home/nextjs/apps/web/uploads
+      - saml-connection:/home/nextjs/apps/web/saml-connection
+    depends_on:
+      authzed-initialize:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+      cube:
+        condition: service_healthy
+
+volumes:
+  postgres:
+  redis:
+  uploads:
+  saml-connection:
